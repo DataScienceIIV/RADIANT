@@ -1,4 +1,11 @@
-# Dependencies for RADIANT_usr_v0.1
+# Dependencies for RADIANT_usr_v0.3
+versionDep = "v0.3"
+
+versionCheck = function(){
+  if(versionRMD != versionDep){
+    stop("Pipeline and dependencies file do not have the same version")
+  }
+}
 
 # I. Pre-processing ----
 
@@ -10,7 +17,7 @@
                   "BiocGenerics", "diffcyt", "cowplot", "knitr", "BiocStyle", "flowAI", "pdftools", "metR", "gridExtra", "reshape2",
                   "PeacoQC", "ggpubr", "pheatmap", "tidyr", "FlowSOM", "openCyto", "BiocManager", "Spectre", "CytoNorm", "premessa", "rstatix", 
                   "digest", "umap", "clustRcheck", "Rphenograph", "colorRamp2", "data.table", "grid", "ConsensusClusterPlus", "dbscan", "uwot", 
-                  "RcppHNSW", "rnndescent", "tsne", "snifter", "cluster", "clusterCrit", "ggsci", "ash")
+                  "RcppHNSW", "rnndescent", "tsne", "snifter", "cluster", "clusterCrit", "ggsci", "ash", "CompensAID")
   
   cranPackages = c("readxl", "ggplot2", "tidyverse", "xlsx", "Rcpp", "RColorBrewer", "matrixStats", "dplyr", "dbplyr", "cowplot", "knitr", 
                    "pdftools", "metR", "gridExtra", "reshape2", "ggpubr", "pheatmap", "tidyr", "BiocManager", "rstatix", "colorRamp2", "data.table", 
@@ -21,7 +28,7 @@
                    "BiocGenerics", "diffcyt", "BiocStyle", "flowAI", "PeacoQC", "FlowSOM", "openCyto", "ConsensusClusterPlus", "snifter")
   
   # updating gitPackages requires adding lines in the autoInstallpkg function as well
-  gitPackages = c("Spectre", "CytoNorm", "premessa", "clustRcheck", "Rphenograph")
+  gitPackages = c("Spectre", "CytoNorm", "premessa", "clustRcheck", "Rphenograph", "CompensAID")
 
   autoInstallpkg = function(reqPackages. = reqPackages, cranPackages. = cranPackages, biocPackages. = biocPackages, gitPackages. = gitPackages){
     
@@ -79,6 +86,7 @@
           install_github("ParkerICI/premessa")
           install_github("Kawameicha/clustRcheck")
           install_github("JinmiaoChenLab/Rphenograph")
+          install_github("Olsman/CompensAID")
           
           cat("> Github packages successfully installed.\n")
         }
@@ -494,7 +502,10 @@
   }
 
   cleanAndTransform = function(){
-    
+    ##Map files and directories
+    #set locations of comp_ref_mapping and reference_specification files
+    assign("cmf", paste0(wd, "/", cellType, "/", expID, " Catalyst ", cellType, " Comp_Ref_mapping_file.xlsx"), envir = .GlobalEnv)
+    assign("rmf" , paste0(wd, "/", cellType, "/", expID, " Catalyst ", cellType, " Reference_specification_file.xlsx"), envir = .GlobalEnv)
     
     
     if (cleaningMethod == "None" & transformationMethod == "None"){
@@ -503,10 +514,7 @@
       assign("internalPQCcheck", FALSE, envir = .GlobalEnv)
     } else{
       
-      ##Map files and directories
-      #set locations of comp_ref_mapping and reference_specification files
-      assign("cmf", paste0(wd, "/", cellType, "/", expID, " Catalyst ", cellType, " Comp_Ref_mapping_file.xlsx"), envir = .GlobalEnv)
-      assign("rmf" , paste0(wd, "/", cellType, "/", expID, " Catalyst ", cellType, " Reference_specification_file.xlsx"), envir = .GlobalEnv)
+      
       
       #import the mapping files
       compMap = read.xlsx(cmf, 1, stringsAsFactors=FALSE)
@@ -771,6 +779,94 @@
     }
   }
   
+  
+  runCompAID = function(){
+    if(performCompAID == TRUE){
+      refCompMap = read.xlsx(rmf, 1, stringsAsFactors=FALSE)
+      refFiles = gsub(".fcs", "", refCompMap$file_name)
+      
+      dir.create(paste0(rsl,"/00 CompensAID"))
+      if(to_import == "a" & transformationMethod == "None"){
+        stop("CompensationAID can only be run on transformed data. Please set to_import to 'b' or 'c' if you've performed transformation and/or cleaning before, or perform at least tranformation")
+      }else if((to_import == "a" & transformationMethod != "None" & cleaningMethod == "PeacoQC")|(to_import == "b" & cleaningMethod == "PeacoQC")|(to_import == "c")){
+        refFiles = paste0(refFiles, "_QC.fcs")
+        refFileLoc = paste0(wd,"/", cellType, "/01 FCS files/02 cleaned and transformed files/Preprocessed/QC/PeacoQC_results/fcs_files/")
+      }else if((to_import == "a" & transformationMethod != "None")|(to_import == "b" & cleaningMethod == "None")){
+        refFiles = paste0(refFiles, ".fcs")
+        refFileLoc = paste0(wd,"/", cellType, "/01 FCS files/01 transformed files/")
+      }
+      
+      for(refFile in refFiles){
+        dir.create(paste0(rsl,"/00 CompensAID/", gsub(".fcs", "", refFile)))
+        caid = paste0(rsl, "/00 CompensAID/", gsub(".fcs", "", refFile))
+        ff = read.FCS(paste0(refFileLoc, refFile), truncate_max_range = FALSE, transformation = FALSE) #import reference file
+        
+        #perform CompensAID
+        compAID = CompensAID(ff)
+        compAIDdf = as.data.frame(compAID$matrix)
+        compAIDdf = tibble::rownames_to_column(compAIDdf, "spillover")
+        compAIDlong = pivot_longer(compAIDdf, cols = 2:ncol(compAIDdf), names_to = "target", values_to = "ssi")
+        
+        compAIDlong$result = if_else(compAIDlong$ssi<(-1), "overcompensated", if_else(compAIDlong$ssi>1, "undercompensated", if_else(is.na(compAIDlong$ssi), NA, "correct")))
+        
+        toExclude = which(!(unique(compAID$matrixInfo$primary.marker) %in% markers_of_interest)) # get the index values of the markers that are not transformed
+        toExclude = unique(compAID$matrixInfo$primary.marker)[toExclude] # get the marker names of non-transformed markers
+        toExclude = as.vector(pData(parameters(ff))$name[which(pData(parameters(ff))$desc %in% toExclude)]) # get the associated channel names
+        compAIDlong = compAIDlong[-c(which(compAIDlong$spillover %in% toExclude),which(compAIDlong$target %in% toExclude)),] # remove data of non-transformed channels
+        
+        n = ggplot(compAIDlong, aes(x = spillover, y = reorder(target, desc(target)), fill = result))+
+          geom_tile(alpha = 0.5)+
+          geom_text(aes(label = ssi))+
+          theme(panel.grid.major = element_blank(),
+                panel.grid.minor = element_blank(),
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+          scale_fill_manual(values = c("correct" = "darkolivegreen2", "overcompensated" = "tomato2", "undercompensated" = "steelblue2", "NA" = "grey50"))+
+          ggtitle("CompensAID results matrix")+
+          ylab("target")+
+          xlab("spillover")
+        
+        if(plotCompAID == TRUE){
+          print(n)
+        }
+        
+        
+        ggsave(paste0(caid, "/compensAID_results_matrix.png"), device = "png", width = 20, height = 15)
+        
+        
+        df_ff <- as.data.frame(exprs(ff))
+        
+        if(is.numeric(maxCells)){
+          df_ff = df_ff[1:maxCells,]
+        }else if(maxCells != "All" & !is.numeric(maxCells)){
+          stop("Invalid argument maxCells")
+        } 
+        
+        for(i in c("overcompensated", "undercompensated")){  
+          tempList = which(compAIDlong$result == i)
+          for(j in tempList){
+            m = ggplot(df_ff, aes(x = .data[[compAIDlong$target[j]]], y = .data[[compAIDlong$spillover[j]]])) + 
+              geom_point(alpha = 0.3, size = 0.5) + 
+              theme_minimal()+
+              ylab(unique(compAID$matrixInfo$pretty.primary)[which(grepl(compAIDlong$spillover[j], unique(compAID$matrixInfo$pretty.primary)))])+
+              xlab(unique(compAID$matrixInfo$pretty.primary)[which(grepl(compAIDlong$target[j], unique(compAID$matrixInfo$pretty.primary)))])+
+              ggtitle(refFile)
+            
+            if(plotCompAID == TRUE){
+              print(m)
+            }
+            
+            
+            targetMarker = unique(compAID$matrixInfo$primary.marker)[which(grepl(compAIDlong$target[j], unique(compAID$matrixInfo$pretty.primary)))]
+            spilloverMarker = unique(compAID$matrixInfo$secondary.marker)[which(grepl(compAIDlong$spillover[j], unique(compAID$matrixInfo$pretty.secondary)))]
+            
+            ggsave(paste0(caid, "/", i, "_", targetMarker, "_vs_", spilloverMarker,".png"), device = "png")
+          }
+        }  
+        
+      }
+    }
+  }
+  
   writePanelFile = function(){
     if (writePanel == TRUE){
       tempMarkers = as.character(pData(parameters(fs[[1]]))$desc)
@@ -780,7 +876,7 @@
         }
       }
       assign("markers", c(colnames(fs)), envir = .GlobalEnv)
-      write.xlsx(data.frame(index_values = 1:length(markers), fcs_colname = markers, antigen=tempMarkers, marker_class=vector(length=length(markers)), run_asinh=vector(length=length(markers)), cofactor = rep(200, length(markers))), pnl, row.names = FALSE)
+      write.xlsx(data.frame(index_values = 1:length(markers), fcs_colname = markers, antigen=tempMarkers, marker_class=vector(length=length(markers))), pnl, row.names = FALSE)
       message ("Panel file template successfully written. You can now indicate which markers should be used for cluster analysis by writing 'type' in the 'marker_class' column. Markers indicated as 'state' will not be taken along for clustering, but the relative expression will still be analysed. Markers indicted as 'none' will not be included in any analyses.\n")
     }
   }
@@ -3724,7 +3820,7 @@
       
       if(performMerge == TRUE){
         print("Initiating cluster merging")
-        PG_MC_temp = cellDataCND$DC_IDs_PG
+        DC_IDs_PG_merged_temp = cellDataCND$DC_IDs_PG
         for(dbmerge in unique(cellDataCND$dbScan)){
           if(length(unique(as.numeric(subset(cellDataCND, dbScan == dbmerge)$DC_IDs_PG)))>1){
             exprsData = as.matrix(subset(cellDataCND, dbScan == dbmerge)[,(globalDimRedMarkers+length(globalDimRedMarkers))])
@@ -3827,21 +3923,21 @@
             
             for(mrg in 1:ncol(mergeMatrix)){
               mergeCluster = which(cellDataCND$DC_IDs_PG == mergeMatrix[2,][mrg])
-              PG_MC_temp[mergeCluster] = mergeMatrix[1,][mrg]
+              DC_IDs_PG_merged_temp[mergeCluster] = mergeMatrix[1,][mrg]
             }
           }  
         }
         
-        updateIDsMap = cbind(sort(unique(PG_MC_temp)), sort(1:length(unique(PG_MC_temp))))
+        updateIDsMap = cbind(sort(unique(DC_IDs_PG_merged_temp)), sort(1:length(unique(DC_IDs_PG_merged_temp))))
         colnames(updateIDsMap) = c("old", "new")
         updateIDsMap = as.data.frame(updateIDsMap)
         
-        PG_MC = vector(length = length(PG_MC_temp))
-        for(newid in unique(PG_MC_temp)){
-          PG_MC[which(PG_MC_temp == newid)] = updateIDsMap$new[which(updateIDsMap$old == newid)]
+        DC_IDs_PG_merged = vector(length = length(DC_IDs_PG_merged_temp))
+        for(newid in unique(DC_IDs_PG_merged_temp)){
+          DC_IDs_PG_merged[which(DC_IDs_PG_merged_temp == newid)] = updateIDsMap$new[which(updateIDsMap$old == newid)]
         }
         
-        cellDataCND$PG_MC = PG_MC
+        cellDataCND$DC_IDs_PG_merged = DC_IDs_PG_merged
         print("Finished cluster merging")
       }
       
@@ -3905,9 +4001,9 @@
           #   idx = idx+1
           #   tempList = c()
           #   tempList[1] = sid
-          #   for(DCID in seq_along(unique(cellDataCND$PG_MC))){
+          #   for(DCID in seq_along(unique(cellDataCND$DC_IDs_PG_merged))){
           #     totalCells = nrow(subset(cellDataCND, sample_id == sid))
-          #     clusterCells = nrow(subset(cellDataCND, sample_id == sid & PG_MC == DCID))
+          #     clusterCells = nrow(subset(cellDataCND, sample_id == sid & DC_IDs_PG_merged == DCID))
           #     tempList[DCID+1] = (clusterCells / totalCells) * 100
           #   }
           #   percList[[idx]] = tempList
@@ -3919,7 +4015,7 @@
           # print(Sys.time())
           
           clusterPercents <- cellDataCND %>%
-            group_by(sample_id, PG_MC) %>%
+            group_by(sample_id, DC_IDs_PG_merged) %>%
             summarise(clusterCells = n(), .groups = "drop") %>%
             group_by(sample_id) %>%
             mutate(totalCells = sum(clusterCells),
@@ -3927,9 +4023,9 @@
             ungroup()
           
           clusterResults <- clusterPercents %>%
-            select(sample_id, PG_MC, percent) %>%
+            select(sample_id, DC_IDs_PG_merged, percent) %>%
             pivot_wider(
-              names_from = PG_MC,
+              names_from = DC_IDs_PG_merged,
               values_from = percent,
               names_prefix = "PG"
             )
@@ -4101,7 +4197,7 @@
           for(dbc in unique(cellDataCND$dbScan)){
             print(paste0("Writing heatmap of merged phenograph clusters for dbScan cluster " , dbc))
             exprsData = as.matrix(subset(cellDataCND, dbScan == dbc)[,(globalDimRedMarkers+length(globalDimRedMarkers))])
-            exprsData = cbind(subset(cellDataCND, dbScan == dbc)$PG_MC, exprsData)
+            exprsData = cbind(subset(cellDataCND, dbScan == dbc)$DC_IDs_PG_merged, exprsData)
             
             exprsData = aggregate(exprsData[,-1], by = list(pgCluster = exprsData[,1]), FUN = median)
             pgCluster = exprsData$pgCluster
